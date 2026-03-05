@@ -7,6 +7,7 @@ on:
     paths:
       - '**.tf'
       - '**.tfvars'
+      - 'lambda/**'
       - '.github/workflows/terraform.yml'
 
   workflow_dispatch:
@@ -51,6 +52,18 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Build lambda_bundle/ so Terraform archive_file source_dir works
+      - name: Build Lambda bundle with psycopg2
+        run: |
+          mkdir -p lambda_bundle
+          pip3 install psycopg2-binary \
+            --platform manylinux2014_x86_64 \
+            --target lambda_bundle \
+            --only-binary=:all: \
+            --quiet
+          cp lambda/aurora_connector.py lambda_bundle/lambda_function.py
+          echo "✅ Bundle ready. Files: $(ls lambda_bundle | wc -l)"
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -78,9 +91,7 @@ jobs:
       - name: Terraform Plan
         id: plan
         run: |
-          terraform plan \
-            -var="psycopg2_layer_arn=arn:aws:lambda:us-east-1:123456789012:layer:placeholder:1" \
-            -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
           echo "PLAN_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
         continue-on-error: true
 
@@ -94,26 +105,20 @@ jobs:
             const truncated = planOutput.length > 60000
               ? planOutput.substring(0, 60000) + '\n\n... [truncated]'
               : planOutput;
-
             const body = `## 🔍 Terraform Plan Results
-
             | Step | Status |
             |------|--------|
-            | Format | ${{ steps.fmt.outcome == 'success' && '✅' || '⚠️' }} \`${{ steps.fmt.outcome }}\` |
-            | Init   | ${{ steps.init.outcome == 'success' && '✅' || '❌' }} \`${{ steps.init.outcome }}\` |
+            | Format   | ${{ steps.fmt.outcome == 'success' && '✅' || '⚠️' }} \`${{ steps.fmt.outcome }}\` |
+            | Init     | ${{ steps.init.outcome == 'success' && '✅' || '❌' }} \`${{ steps.init.outcome }}\` |
             | Validate | ${{ steps.validate.outcome == 'success' && '✅' || '❌' }} \`${{ steps.validate.outcome }}\` |
-            | Plan | ${{ steps.plan.outcome == 'success' && '✅' || '❌' }} \`${{ steps.plan.outcome }}\` |
-
+            | Plan     | ${{ steps.plan.outcome == 'success' && '✅' || '❌' }} \`${{ steps.plan.outcome }}\` |
             <details><summary>📋 Show Plan Output</summary>
 
             \`\`\`hcl
             ${truncated}
             \`\`\`
-
             </details>
-
             > Triggered by @${{ github.actor }} on \`${{ github.head_ref }}\``;
-
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -144,36 +149,20 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # -------------------------------------------------------
-      # Build and publish psycopg2 layer BEFORE terraform apply
-      # This ensures the real layer ARN exists in AWS first
-      # -------------------------------------------------------
-      - name: Build psycopg2 Lambda layer
+      # Bundle psycopg2 + connector into lambda_bundle/
+      # Terraform zips this directory via archive_file source_dir
+      - name: Build Lambda bundle with psycopg2
         run: |
-          mkdir -p layer/python/lib/python3.12/site-packages
+          mkdir -p lambda_bundle
           pip3 install psycopg2-binary \
             --platform manylinux2014_x86_64 \
-            --target layer/python/lib/python3.12/site-packages \
+            --target lambda_bundle \
             --only-binary=:all: \
             --quiet
-          cd layer && zip -r ../psycopg2-layer.zip python/
-          echo "✅ Layer zip size: $(du -sh ../psycopg2-layer.zip)"
-          echo "✅ Layer contents:"
-          unzip -l ../psycopg2-layer.zip | head -20
-
-      - name: Publish psycopg2 layer to AWS
-        id: publish-layer
-        run: |
-          LAYER_ARN=$(aws lambda publish-layer-version \
-            --layer-name "onedata-task4-psycopg2" \
-            --description "psycopg2-binary for PostgreSQL connectivity" \
-            --compatible-runtimes python3.12 \
-            --zip-file fileb://psycopg2-layer.zip \
-            --region "$AWS_REGION" \
-            --query 'LayerVersionArn' \
-            --output text)
-          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
-          echo "✅ Layer published: $LAYER_ARN"
+          cp lambda/aurora_connector.py lambda_bundle/lambda_function.py
+          echo "✅ Lambda bundle contents:"
+          ls lambda_bundle/
+          echo "✅ psycopg2 present: $(ls lambda_bundle/ | grep psycopg2)"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -190,10 +179,7 @@ jobs:
             -backend-config="encrypt=true"
 
       - name: Terraform Plan
-        run: |
-          terraform plan \
-            -var="psycopg2_layer_arn=${{ env.LAYER_ARN }}" \
-            -no-color -out=tfplan
+        run: terraform plan -no-color -out=tfplan
 
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
@@ -205,39 +191,43 @@ jobs:
         run: |
           LAMBDA_NAME=$(terraform output -raw lambda_function_name)
           echo "==> Invoking Lambda: $LAMBDA_NAME"
-
-          # Wait a few seconds for Lambda to be fully ready
           sleep 5
 
           aws lambda invoke \
             --function-name "$LAMBDA_NAME" \
             --region "$AWS_REGION" \
             --log-type Tail \
-            response.json \
-            | tee invoke_result.json
+            response.json | tee invoke_result.json
 
           echo ""
           echo "==> Lambda response:"
           cat response.json
 
+          # Decode CloudWatch logs from response for debugging
+          LOG_RESULT=$(python3 -c "
+          import sys, json, base64
+          d = json.load(open('invoke_result.json'))
+          print(base64.b64decode(d.get('LogResult','')).decode())
+          " 2>/dev/null || echo "Could not decode logs")
+          echo ""
+          echo "==> Lambda logs:"
+          echo "$LOG_RESULT"
+
           if grep -q "SUCCESS" response.json; then
             echo ""
             echo "✅ Lambda successfully connected to RDS PostgreSQL!"
           else
-            echo ""
-            echo "❌ Lambda did not return SUCCESS. Check CloudWatch logs."
-            # Decode and print logs for debugging
-            LOG_RESULT=$(cat invoke_result.json | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d.get('LogResult','')).decode())" 2>/dev/null || echo "Could not decode logs")
-            echo "$LOG_RESULT"
+            echo "❌ Lambda did not return SUCCESS."
             exit 1
           fi
 
-      - name: Print CloudWatch log group
+      - name: Print CloudWatch log group URL
         run: |
           LOG_GROUP=$(terraform output -raw cloudwatch_log_group)
+          ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$LOG_GROUP', safe=''))")
           echo ""
-          echo "📋 View full Lambda logs at:"
-          echo "https://console.aws.amazon.com/cloudwatch/home?region=$AWS_REGION#logsV2:log-groups/log-group/$LOG_GROUP"
+          echo "📋 CloudWatch logs:"
+          echo "https://console.aws.amazon.com/cloudwatch/home?region=$AWS_REGION#logsV2:log-groups/log-group/$ENCODED"
 
   # -------------------------------------------------------
   # Terraform Destroy — manual dispatch only
@@ -258,6 +248,12 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Need lambda_bundle/ present so Terraform can read archive_file source_dir
+      - name: Build Lambda bundle (needed for destroy plan)
+        run: |
+          mkdir -p lambda_bundle
+          cp lambda/aurora_connector.py lambda_bundle/lambda_function.py
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -273,24 +269,7 @@ jobs:
             -backend-config="encrypt=true"
 
       - name: Terraform Destroy
-        run: |
-          terraform destroy \
-            -var="psycopg2_layer_arn=arn:aws:lambda:us-east-1:123456789012:layer:placeholder:1" \
-            -auto-approve
-
-      - name: Clean up psycopg2 layer versions
-        run: |
-          aws lambda list-layer-versions \
-            --layer-name "onedata-task4-psycopg2" \
-            --region "$AWS_REGION" \
-            --query 'LayerVersions[*].Version' \
-            --output text | tr '\t' '\n' | while read version; do
-              aws lambda delete-layer-version \
-                --layer-name "onedata-task4-psycopg2" \
-                --version-number "$version" \
-                --region "$AWS_REGION"
-              echo "Deleted layer version: $version"
-            done
+        run: terraform destroy -auto-approve
 
       - name: Destroy complete
         run: echo "✅ All infrastructure destroyed successfully."

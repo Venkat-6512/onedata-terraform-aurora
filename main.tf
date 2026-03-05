@@ -347,6 +347,7 @@ resource "aws_iam_role_policy" "lambda" {
         # Scoped to specific secret ARN — NO wildcard resources
         Resource = aws_secretsmanager_secret.db_password.arn
       },
+
       {
         Sid    = "CloudWatchLogs"
         Effect = "Allow"
@@ -442,10 +443,7 @@ resource "aws_cloudwatch_log_group" "lambda" {
 data "archive_file" "lambda" {
   type        = "zip"
   output_path = "/tmp/aurora_connector.zip"
-  source {
-    content  = file("${path.module}/lambda/aurora_connector.py")
-    filename = "lambda_function.py"
-  }
+  source_dir  = "${path.module}/lambda_bundle"
 }
 
 resource "aws_lambda_function" "aurora_connector" {
@@ -455,9 +453,7 @@ resource "aws_lambda_function" "aurora_connector" {
   handler          = "lambda_function.lambda_handler"
   runtime          = "python3.12"
   source_code_hash = data.archive_file.lambda.output_base64sha256
-  timeout          = 30
-  layers           = [var.psycopg2_layer_arn]
-
+  timeout          = 60
   vpc_config {
     subnet_ids         = aws_subnet.isolated[*].id
     security_group_ids = [aws_security_group.lambda.id]
