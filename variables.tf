@@ -39,3 +39,9 @@ variable "rotation_days" {
   type        = number
   default     = 30
 }
+
+variable "psycopg2_layer_arn" {
+  description = "ARN of the psycopg2 Lambda layer (published via GitHub Actions before terraform apply)"
+  type        = string
+  default     = ""
+}

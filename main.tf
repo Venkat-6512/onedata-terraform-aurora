@@ -424,16 +424,6 @@ resource "aws_iam_role_policy" "rotation_lambda" {
 }
 
 # ================================================================
-# Lambda Layer — psycopg2 (built in GitHub Actions, uploaded here)
-# ================================================================
-resource "aws_lambda_layer_version" "psycopg2" {
-  filename            = "${path.module}/psycopg2-layer.zip"
-  layer_name          = "${var.project_name}-psycopg2"
-  compatible_runtimes = ["python3.12"]
-  description         = "psycopg2-binary for PostgreSQL connectivity"
-}
-
-# ================================================================
 # CloudWatch Log Group
 # ================================================================
 resource "aws_cloudwatch_log_group" "lambda" {
@@ -466,7 +456,7 @@ resource "aws_lambda_function" "aurora_connector" {
   runtime          = "python3.12"
   source_code_hash = data.archive_file.lambda.output_base64sha256
   timeout          = 30
-  layers           = [aws_lambda_layer_version.psycopg2.arn]
+  layers           = [var.psycopg2_layer_arn]
 
   vpc_config {
     subnet_ids         = aws_subnet.isolated[*].id

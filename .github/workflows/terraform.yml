@@ -22,72 +22,28 @@ on:
           - destroy
 
 permissions:
-  id-token: write       # Required for OIDC token
-  contents: read        # Required to checkout code
-  pull-requests: write  # Required to post plan comments on PRs
+  id-token: write
+  contents: read
+  pull-requests: write
 
 env:
   AWS_REGION: us-east-1
   TF_STATE_BUCKET: onedata-task4-tfstate-venkat
   TF_STATE_DYNAMODB: onedata-task4-tfstate-lock
   TF_VERSION: 1.7.5
-  WORKING_DIR: .
 
 jobs:
-  # -------------------------------------------------------
-  # Build psycopg2 Lambda Layer
-  # Runs before plan/apply so the zip is available to Terraform
-  # -------------------------------------------------------
-  build-layer:
-    name: Build psycopg2 Lambda Layer
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build psycopg2 layer zip
-        run: |
-          mkdir -p layer/python
-          pip3 install psycopg2-binary \
-            --platform manylinux2014_x86_64 \
-            --target layer/python \
-            --only-binary=:all: \
-            --quiet
-          cd layer
-          zip -r ../psycopg2-layer.zip python/
-          echo "✅ Layer zip created: $(du -sh ../psycopg2-layer.zip)"
-
-      - name: Upload layer zip as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: psycopg2-layer
-          path: psycopg2-layer.zip
-          retention-days: 1
-
   # -------------------------------------------------------
   # Terraform Plan — runs on every PR
   # -------------------------------------------------------
   terraform-plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
-    needs: build-layer
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
-
-    defaults:
-      run:
-        working-directory: ${{ env.WORKING_DIR }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Download psycopg2 layer zip
-        uses: actions/download-artifact@v4
-        with:
-          name: psycopg2-layer
-          path: .
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -122,16 +78,11 @@ jobs:
       - name: Terraform Plan
         id: plan
         run: |
-          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          terraform plan \
+            -var="psycopg2_layer_arn=arn:aws:lambda:us-east-1:123456789012:layer:placeholder:1" \
+            -no-color -out=tfplan 2>&1 | tee plan_output.txt
           echo "PLAN_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
         continue-on-error: true
-
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfplan
-          path: tfplan
-          retention-days: 5
 
       - name: Post Plan to PR
         if: github.event_name == 'pull_request'
@@ -180,29 +131,47 @@ jobs:
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
-    needs: build-layer
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
     environment: production
-
-    defaults:
-      run:
-        working-directory: ${{ env.WORKING_DIR }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Download psycopg2 layer zip
-        uses: actions/download-artifact@v4
-        with:
-          name: psycopg2-layer
-          path: .
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      # -------------------------------------------------------
+      # Build and publish psycopg2 layer BEFORE terraform apply
+      # This ensures the real layer ARN exists in AWS first
+      # -------------------------------------------------------
+      - name: Build psycopg2 Lambda layer
+        run: |
+          mkdir -p layer/python
+          pip3 install psycopg2-binary \
+            --platform manylinux2014_x86_64 \
+            --target layer/python \
+            --only-binary=:all: \
+            --quiet
+          cd layer && zip -r ../psycopg2-layer.zip python/
+          echo "✅ Layer zip size: $(du -sh ../psycopg2-layer.zip)"
+
+      - name: Publish psycopg2 layer to AWS
+        id: publish-layer
+        run: |
+          LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name "onedata-task4-psycopg2" \
+            --description "psycopg2-binary for PostgreSQL connectivity" \
+            --compatible-runtimes python3.12 \
+            --zip-file fileb://psycopg2-layer.zip \
+            --region "$AWS_REGION" \
+            --query 'LayerVersionArn' \
+            --output text)
+          echo "LAYER_ARN=$LAYER_ARN" >> $GITHUB_ENV
+          echo "✅ Layer published: $LAYER_ARN"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -219,7 +188,10 @@ jobs:
             -backend-config="encrypt=true"
 
       - name: Terraform Plan
-        run: terraform plan -no-color -out=tfplan
+        run: |
+          terraform plan \
+            -var="psycopg2_layer_arn=${{ env.LAYER_ARN }}" \
+            -no-color -out=tfplan
 
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
@@ -231,6 +203,9 @@ jobs:
         run: |
           LAMBDA_NAME=$(terraform output -raw lambda_function_name)
           echo "==> Invoking Lambda: $LAMBDA_NAME"
+
+          # Wait a few seconds for Lambda to be fully ready
+          sleep 5
 
           aws lambda invoke \
             --function-name "$LAMBDA_NAME" \
@@ -249,6 +224,9 @@ jobs:
           else
             echo ""
             echo "❌ Lambda did not return SUCCESS. Check CloudWatch logs."
+            # Decode and print logs for debugging
+            LOG_RESULT=$(cat invoke_result.json | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d.get('LogResult','')).decode())" 2>/dev/null || echo "Could not decode logs")
+            echo "$LOG_RESULT"
             exit 1
           fi
 
@@ -267,10 +245,6 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
     environment: production
-
-    defaults:
-      run:
-        working-directory: ${{ env.WORKING_DIR }}
 
     steps:
       - name: Checkout code
@@ -297,7 +271,24 @@ jobs:
             -backend-config="encrypt=true"
 
       - name: Terraform Destroy
-        run: terraform destroy -auto-approve
+        run: |
+          terraform destroy \
+            -var="psycopg2_layer_arn=arn:aws:lambda:us-east-1:123456789012:layer:placeholder:1" \
+            -auto-approve
+
+      - name: Clean up psycopg2 layer versions
+        run: |
+          aws lambda list-layer-versions \
+            --layer-name "onedata-task4-psycopg2" \
+            --region "$AWS_REGION" \
+            --query 'LayerVersions[*].Version' \
+            --output text | tr '\t' '\n' | while read version; do
+              aws lambda delete-layer-version \
+                --layer-name "onedata-task4-psycopg2" \
+                --version-number "$version" \
+                --region "$AWS_REGION"
+              echo "Deleted layer version: $version"
+            done
 
       - name: Destroy complete
         run: echo "✅ All infrastructure destroyed successfully."
