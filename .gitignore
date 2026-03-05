@@ -1,0 +1,65 @@
+# Local .terraform directories
+**/.terraform/*
+
+# Terraform lockfile (commit this if you want reproducible provider versions)
+# .terraform.lock.hcl
+
+# Terraform state files - NEVER commit these
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform plan files - contain sensitive data
+tfplan
+*.tfplan
+plan_output.txt
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Terraform variable files that may contain secrets
+*.tfvars.json
+# Uncomment below if your tfvars contain secrets (use GitHub secrets instead)
+# *.tfvars
+
+# Override files (local developer overrides)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Lambda build artifacts
+*.zip
+/tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# GitHub Actions local runner
+.act/
+
+# Sensitive files - never commit
+*.pem
+*.key
+*.crt
+*.env
+.env*

@@ -1,0 +1,258 @@
+name: Terraform - Aurora Infrastructure
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform.yml'
+
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to run'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  id-token: write       # Required for OIDC token
+  contents: read        # Required to checkout code
+  pull-requests: write  # Required to post plan comments on PRs
+
+env:
+  AWS_REGION: us-east-1
+  TF_STATE_BUCKET: onedata-task4-tfstate-venkat
+  TF_STATE_DYNAMODB: onedata-task4-tfstate-lock
+  TF_VERSION: 1.7.5
+  WORKING_DIR: .
+
+jobs:
+  # -------------------------------------------------------
+  # Terraform Plan — runs on every PR
+  # -------------------------------------------------------
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=task4/aurora/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_STATE_DYNAMODB }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan_output.txt
+          echo "PLAN_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 5
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('plan_output.txt', 'utf8');
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n\n... [truncated]'
+              : planOutput;
+
+            const body = `## 🔍 Terraform Plan Results
+
+            | Step | Status |
+            |------|--------|
+            | Format | ${{ steps.fmt.outcome == 'success' && '✅' || '⚠️' }} \`${{ steps.fmt.outcome }}\` |
+            | Init   | ${{ steps.init.outcome == 'success' && '✅' || '❌' }} \`${{ steps.init.outcome }}\` |
+            | Validate | ${{ steps.validate.outcome == 'success' && '✅' || '❌' }} \`${{ steps.validate.outcome }}\` |
+            | Plan | ${{ steps.plan.outcome == 'success' && '✅' || '❌' }} \`${{ steps.plan.outcome }}\` |
+
+            <details><summary>📋 Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+
+            </details>
+
+            > Triggered by @${{ github.actor }} on \`${{ github.head_ref }}\``;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail if plan failed
+        if: env.PLAN_EXIT_CODE != '0'
+        run: exit 1
+
+  # -------------------------------------------------------
+  # Terraform Apply — manual dispatch only
+  # -------------------------------------------------------
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
+    environment: production   # Manual approval gate in GitHub Environments
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=task4/aurora/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_STATE_DYNAMODB }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Plan
+        run: terraform plan -no-color -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Show Outputs
+        run: terraform output
+
+      - name: Invoke Lambda to verify DB connection
+        run: |
+          LAMBDA_NAME=$(terraform output -raw lambda_function_name)
+          echo "==> Invoking Lambda: $LAMBDA_NAME"
+
+          aws lambda invoke \
+            --function-name "$LAMBDA_NAME" \
+            --region "$AWS_REGION" \
+            --log-type Tail \
+            response.json \
+            | tee invoke_result.json
+
+          echo ""
+          echo "==> Lambda response:"
+          cat response.json
+
+          # Check for success in response
+          if grep -q "SUCCESS" response.json; then
+            echo ""
+            echo "✅ Lambda successfully connected to Aurora PostgreSQL!"
+          else
+            echo ""
+            echo "❌ Lambda did not return SUCCESS. Check CloudWatch logs."
+            exit 1
+          fi
+
+      - name: Print CloudWatch log group
+        run: |
+          LOG_GROUP=$(terraform output -raw cloudwatch_log_group)
+          echo ""
+          echo "📋 View full Lambda logs at:"
+          echo "https://console.aws.amazon.com/cloudwatch/home?region=$AWS_REGION#logsV2:log-groups/log-group/$LOG_GROUP"
+
+  # -------------------------------------------------------
+  # Terraform Destroy — manual dispatch only
+  # -------------------------------------------------------
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    environment: production   # Requires manual approval before destroying
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=task4/aurora/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.TF_STATE_DYNAMODB }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      - name: Destroy complete
+        run: echo "✅ All infrastructure destroyed successfully."
