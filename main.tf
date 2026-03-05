@@ -295,7 +295,7 @@ resource "aws_rds_cluster" "aurora" {
 
   skip_final_snapshot     = true
   deletion_protection     = false
-  backup_retention_period = 7
+  backup_retention_period = 1
   storage_encrypted       = true
 
   depends_on = [aws_secretsmanager_secret_version.db_password]
