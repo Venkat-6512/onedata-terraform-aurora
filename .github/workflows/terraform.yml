@@ -150,14 +150,16 @@ jobs:
       # -------------------------------------------------------
       - name: Build psycopg2 Lambda layer
         run: |
-          mkdir -p layer/python
+          mkdir -p layer/python/lib/python3.12/site-packages
           pip3 install psycopg2-binary \
             --platform manylinux2014_x86_64 \
-            --target layer/python \
+            --target layer/python/lib/python3.12/site-packages \
             --only-binary=:all: \
             --quiet
           cd layer && zip -r ../psycopg2-layer.zip python/
           echo "✅ Layer zip size: $(du -sh ../psycopg2-layer.zip)"
+          echo "✅ Layer contents:"
+          unzip -l ../psycopg2-layer.zip | head -20
 
       - name: Publish psycopg2 layer to AWS
         id: publish-layer
