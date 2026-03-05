@@ -35,11 +35,44 @@ env:
 
 jobs:
   # -------------------------------------------------------
+  # Build psycopg2 Lambda Layer
+  # Runs before plan/apply so the zip is available to Terraform
+  # -------------------------------------------------------
+  build-layer:
+    name: Build psycopg2 Lambda Layer
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build psycopg2 layer zip
+        run: |
+          mkdir -p layer/python
+          pip3 install psycopg2-binary \
+            --platform manylinux2014_x86_64 \
+            --target layer/python \
+            --only-binary=:all: \
+            --quiet
+          cd layer
+          zip -r ../psycopg2-layer.zip python/
+          echo "✅ Layer zip created: $(du -sh ../psycopg2-layer.zip)"
+
+      - name: Upload layer zip as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: psycopg2-layer
+          path: psycopg2-layer.zip
+          retention-days: 1
+
+  # -------------------------------------------------------
   # Terraform Plan — runs on every PR
   # -------------------------------------------------------
   terraform-plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
+    needs: build-layer
     if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
 
     defaults:
@@ -49,6 +82,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download psycopg2 layer zip
+        uses: actions/download-artifact@v4
+        with:
+          name: psycopg2-layer
+          path: .
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -141,8 +180,9 @@ jobs:
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
+    needs: build-layer
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
-    environment: production   # Manual approval gate in GitHub Environments
+    environment: production
 
     defaults:
       run:
@@ -151,6 +191,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download psycopg2 layer zip
+        uses: actions/download-artifact@v4
+        with:
+          name: psycopg2-layer
+          path: .
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -197,10 +243,9 @@ jobs:
           echo "==> Lambda response:"
           cat response.json
 
-          # Check for success in response
           if grep -q "SUCCESS" response.json; then
             echo ""
-            echo "✅ Lambda successfully connected to Aurora PostgreSQL!"
+            echo "✅ Lambda successfully connected to RDS PostgreSQL!"
           else
             echo ""
             echo "❌ Lambda did not return SUCCESS. Check CloudWatch logs."
@@ -221,7 +266,7 @@ jobs:
     name: Terraform Destroy
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
-    environment: production   # Requires manual approval before destroying
+    environment: production
 
     defaults:
       run:
