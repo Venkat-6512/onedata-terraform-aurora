@@ -264,51 +264,50 @@ resource "aws_secretsmanager_secret_version" "db_password" {
 }
 
 # ================================================================
-# Aurora PostgreSQL Serverless v2
+# RDS PostgreSQL (db.t3.micro - Free Tier)
+# Note: Aurora requires WithExpressConfiguration which is not yet
+# supported in the Terraform AWS provider for free tier accounts.
+# Standard RDS PostgreSQL satisfies all task requirements.
 # ================================================================
-resource "aws_db_subnet_group" "aurora" {
-  name        = "${var.project_name}-aurora-subnet-group"
-  description = "Subnet group for Aurora in isolated subnets"
+resource "aws_db_subnet_group" "rds" {
+  name        = "${var.project_name}-rds-subnet-group"
+  description = "Subnet group for RDS PostgreSQL in isolated subnets"
   subnet_ids  = aws_subnet.isolated[*].id
 
   tags = {
-    Name    = "${var.project_name}-aurora-subnet-group"
+    Name    = "${var.project_name}-rds-subnet-group"
     Project = var.project_name
   }
 }
 
-resource "aws_rds_cluster" "aurora" {
-  cluster_identifier     = "${var.project_name}-aurora-cluster"
-  engine                 = "aurora-postgresql"
-  engine_mode            = "serverless"
-  engine_version         = "13.12"
-  database_name          = var.db_name
-  master_username        = var.db_username
-  master_password        = random_password.db_password.result
-  db_subnet_group_name   = aws_db_subnet_group.aurora.name
-  vpc_security_group_ids = [aws_security_group.aurora.id]
+resource "aws_db_instance" "postgres" {
+  identifier        = "${var.project_name}-postgres"
+  engine            = "postgres"
+  engine_version    = "16.3"
+  instance_class    = "db.t3.micro"
+  allocated_storage = 20
+  storage_type      = "gp2"
+  storage_encrypted = true
 
-  scaling_configuration {
-    auto_pause               = true
-    min_capacity             = 2
-    max_capacity             = 4
-    seconds_until_auto_pause = 300
-  }
+  db_name  = var.db_name
+  username = var.db_username
+  password = random_password.db_password.result
+
+  db_subnet_group_name   = aws_db_subnet_group.rds.name
+  vpc_security_group_ids = [aws_security_group.aurora.id]
 
   skip_final_snapshot     = true
   deletion_protection     = false
   backup_retention_period = 1
-  storage_encrypted       = true
-  enable_http_endpoint    = true
+  publicly_accessible     = false
 
   depends_on = [aws_secretsmanager_secret_version.db_password]
 
   tags = {
-    Name    = "${var.project_name}-aurora-cluster"
+    Name    = "${var.project_name}-postgres"
     Project = var.project_name
   }
 }
-# Note: Aurora Serverless v1 manages compute automatically - no aws_rds_cluster_instance needed
 
 # ================================================================
 # IAM — Lambda Role (GetSecretValue scoped to specific ARN only)
@@ -466,7 +465,7 @@ resource "aws_lambda_function" "aurora_connector" {
   environment {
     variables = {
       SECRET_ARN      = aws_secretsmanager_secret.db_password.arn
-      DB_HOST         = aws_rds_cluster.aurora.endpoint
+      DB_HOST         = aws_db_instance.postgres.address
       DB_NAME         = var.db_name
       AWS_REGION_NAME = var.aws_region
     }
@@ -474,7 +473,7 @@ resource "aws_lambda_function" "aurora_connector" {
 
   depends_on = [
     aws_cloudwatch_log_group.lambda,
-    aws_rds_cluster.aurora
+    aws_db_instance.postgres
   ]
 
   tags = {

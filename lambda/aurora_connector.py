@@ -1,5 +1,5 @@
 """
-Aurora PostgreSQL connector Lambda.
+RDS PostgreSQL connector Lambda.
 
 Retrieves DB credentials from Secrets Manager at runtime (never hardcoded),
 connects to the Aurora cluster, and logs a SUCCESS message to CloudWatch.
@@ -67,7 +67,7 @@ def lambda_handler(event, context):
             db_info = cur.fetchone()
 
         logger.info("=" * 60)
-        logger.info("SUCCESS: Connected to Aurora PostgreSQL")
+        logger.info("SUCCESS: Connected to RDS PostgreSQL")
         logger.info(f"Database version: {db_version}")
         logger.info(f"Connected to database: {db_info[0]}")
         logger.info(f"Connected as user: {db_info[1]}")
@@ -78,7 +78,7 @@ def lambda_handler(event, context):
             "statusCode": 200,
             "body": json.dumps({
                 "status": "SUCCESS",
-                "message": "Successfully connected to Aurora PostgreSQL",
+                "message": "Successfully connected to RDS PostgreSQL",
                 "database": db_info[0],
                 "user": db_info[1],
                 "server_time": str(db_info[2]),
@@ -87,7 +87,7 @@ def lambda_handler(event, context):
         }
 
     except psycopg2.OperationalError as e:
-        logger.error(f"FAILED: Could not connect to Aurora PostgreSQL: {str(e)}")
+        logger.error(f"FAILED: Could not connect to RDS PostgreSQL: {str(e)}")
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")

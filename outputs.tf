@@ -3,14 +3,14 @@ output "vpc_id" {
   value       = aws_vpc.main.id
 }
 
-output "aurora_cluster_endpoint" {
-  description = "Aurora cluster writer endpoint"
-  value       = aws_rds_cluster.aurora.endpoint
+output "db_endpoint" {
+  description = "RDS PostgreSQL endpoint"
+  value       = aws_db_instance.postgres.address
 }
 
-output "aurora_cluster_reader_endpoint" {
-  description = "Aurora cluster reader endpoint"
-  value       = aws_rds_cluster.aurora.reader_endpoint
+output "db_port" {
+  description = "RDS PostgreSQL port"
+  value       = aws_db_instance.postgres.port
 }
 
 output "secret_arn" {
