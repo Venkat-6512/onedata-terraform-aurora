@@ -280,23 +280,26 @@ resource "aws_db_subnet_group" "aurora" {
 resource "aws_rds_cluster" "aurora" {
   cluster_identifier     = "${var.project_name}-aurora-cluster"
   engine                 = "aurora-postgresql"
-  engine_mode            = "provisioned"
-  engine_version         = "15.4"
+  engine_mode            = "serverless"
+  engine_version         = "13.12"
   database_name          = var.db_name
   master_username        = var.db_username
   master_password        = random_password.db_password.result
   db_subnet_group_name   = aws_db_subnet_group.aurora.name
   vpc_security_group_ids = [aws_security_group.aurora.id]
 
-  serverlessv2_scaling_configuration {
-    min_capacity = 0.5
-    max_capacity = 4.0
+  scaling_configuration {
+    auto_pause               = true
+    min_capacity             = 2
+    max_capacity             = 4
+    seconds_until_auto_pause = 300
   }
 
   skip_final_snapshot     = true
   deletion_protection     = false
   backup_retention_period = 1
   storage_encrypted       = true
+  enable_http_endpoint    = true
 
   depends_on = [aws_secretsmanager_secret_version.db_password]
 
@@ -305,20 +308,7 @@ resource "aws_rds_cluster" "aurora" {
     Project = var.project_name
   }
 }
-
-resource "aws_rds_cluster_instance" "aurora" {
-  identifier           = "${var.project_name}-aurora-instance-1"
-  cluster_identifier   = aws_rds_cluster.aurora.id
-  instance_class       = "db.serverless"
-  engine               = aws_rds_cluster.aurora.engine
-  engine_version       = aws_rds_cluster.aurora.engine_version
-  db_subnet_group_name = aws_db_subnet_group.aurora.name
-
-  tags = {
-    Name    = "${var.project_name}-aurora-instance-1"
-    Project = var.project_name
-  }
-}
+# Note: Aurora Serverless v1 manages compute automatically - no aws_rds_cluster_instance needed
 
 # ================================================================
 # IAM — Lambda Role (GetSecretValue scoped to specific ARN only)
@@ -484,7 +474,7 @@ resource "aws_lambda_function" "aurora_connector" {
 
   depends_on = [
     aws_cloudwatch_log_group.lambda,
-    aws_rds_cluster_instance.aurora
+    aws_rds_cluster.aurora
   ]
 
   tags = {
